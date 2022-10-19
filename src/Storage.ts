@@ -1,10 +1,11 @@
-import { openSync, readFileSync, readSync, writeFileSync, writeSync } from "fs";
-import { basename } from "path";
+import { appendFileSync, fstatSync, readFileSync, readSync, statSync, writeSync } from "fs";
 import { STORAGE_BYTES, STORAGE_LENGTH_BYTES, STORAGE_POSITION_BYTES } from "./Constants";
 import { openFile } from "./Filesystem";
+import { ColumnType, Table, TableSchema } from "./Table";
 
 /**
- * in memory table store persisted to disk
+ * @class TableStorage
+ * @description Loads and stores row/column table data in a file
  */
 export class TableStorage {
 	public fd!: {
@@ -12,96 +13,117 @@ export class TableStorage {
 		table: number;
 		storage: number;
 	};
-	public row_size!: number;
-	public schema!: TableSchema;
 
-	constructor(public path: string) {}
+	constructor(public table: Table) {}
 
 	init() {
 		this.fd = {
-			schema: openFile(`${this.path}.schema`),
-			table: openFile(`${this.path}.table`),
-			storage: openFile(`${this.path}.storage`),
+			schema: openFile(`${this.table.path}.schema`),
+			table: openFile(`${this.table.path}.table`),
+			storage: openFile(`${this.table.path}.storage`),
 		};
-
-		this.loadSchema();
 	}
 
-	setSchema(schema: TableSchema) {
-		this.schema = schema;
-		this.processSchema();
-	}
-
-	loadSchema() {
-		if (this.schema) return;
-
+	loadSchema(): TableSchema {
 		try {
-			this.schema = JSON.parse(readFileSync(this.fd.schema, { encoding: "utf8" }));
+			return JSON.parse(readFileSync(this.fd.schema, { encoding: "utf8" }));
 		} catch (error) {
-			this.schema = {
-				name: basename(this.path),
+			return {
+				name: "",
 				columns: [],
 			};
 		}
-
-		this.processSchema();
 	}
 
-	processSchema() {
-		this.row_size = this.schema.columns.reduce((a, b) => a + (b.length || STORAGE_BYTES), 0);
-
-		this.saveSchema();
+	saveSchema(schema: TableSchema) {
+		writeSync(this.fd.schema, JSON.stringify(schema), 0, "utf8");
 	}
 
-	saveSchema() {
-		writeSync(this.fd.schema, JSON.stringify(this.schema), 0, "utf8");
+	saveData(index: number, buffer: Buffer) {
+		writeSync(this.fd.table, buffer, 0, buffer.length, this.table.row_size * index);
 	}
 
-	saveRow(index: number, buffer: Buffer) {
-		writeSync(this.fd.table, buffer, 0, buffer.length, this.row_size * index);
+	saveRow(index: number, columns: Buffer[]) {
+		const chunks = [];
+
+		for (var i = 0; i < columns.length; i++) {
+			const column = columns[i];
+
+			if (this.table.schema.columns[i].length) {
+				chunks.push(column.subarray(0, this.table.schema.columns[i].length));
+			} else {
+				const buffer = Buffer.alloc(STORAGE_BYTES);
+				buffer.writeUintBE(this.saveStorage(column), 0, STORAGE_POSITION_BYTES);
+				buffer.writeUintBE(column.length, STORAGE_POSITION_BYTES, STORAGE_LENGTH_BYTES);
+				chunks.push(buffer);
+			}
+		}
+
+		const buffer = Buffer.concat(chunks);
+
+		writeSync(this.fd.table, buffer, 0, buffer.length, index * this.table.row_size);
+	}
+
+	saveColumn(index: number, column: number, buffer: Buffer) {
+		if (this.table.schema.columns[column].length) {
+			buffer = buffer.subarray(0, this.table.schema.columns[column].length);
+		} else {
+			const location = Buffer.alloc(STORAGE_BYTES);
+			location.writeUintBE(this.saveStorage(buffer), 0, STORAGE_POSITION_BYTES);
+			location.writeUintBE(buffer.length, STORAGE_POSITION_BYTES, STORAGE_LENGTH_BYTES);
+			buffer = location;
+		}
+
+		writeSync(
+			this.fd.table,
+			buffer,
+			0,
+			buffer.length,
+			index * this.table.row_size + this.table.getColumnOffset(column)
+		);
 	}
 
 	loadRow(index: number) {
-		const buffer = Buffer.alloc(this.row_size);
+		const buffer = Buffer.alloc(this.table.row_size);
 
 		readSync(this.fd.table, buffer, {
-			position: index * this.row_size,
+			position: index * this.table.row_size,
 		});
 
 		const columns = [];
 		let i = 0;
 
-		for (const column of this.schema.columns) {
+		for (const column of this.table.schema.columns) {
 			if (column.length) {
 				columns.push(buffer.subarray(i, column.length));
 				i += column.length;
 				continue;
 			}
 
-			const pointer = buffer.readUintLE(i, STORAGE_POSITION_BYTES);
-			const length = buffer.readUintLE(i + STORAGE_POSITION_BYTES, STORAGE_LENGTH_BYTES);
-			i += STORAGE_BYTES;
-
-			const storage = this.loadStorage(pointer, length);
+			const storage = this.loadStorage(
+				buffer.readUintBE(i, STORAGE_POSITION_BYTES),
+				buffer.readUintBE(i + STORAGE_POSITION_BYTES, STORAGE_POSITION_BYTES)
+			);
 			columns.push(storage);
+			i += STORAGE_BYTES;
 		}
 
 		return buffer;
 	}
 
 	loadColumn(index: number, column: number) {
-		const buffer = Buffer.alloc(this.schema.columns[column].length || STORAGE_BYTES);
+		const buffer = Buffer.alloc(this.table.schema.columns[column].length || STORAGE_BYTES);
 
 		readSync(this.fd.table, buffer, {
-			position: index * this.row_size,
+			position: index * this.table.row_size + this.table.getColumnOffset(column),
 		});
 
-		if (this.schema.columns[column].length) return buffer;
+		if (this.table.schema.columns[column].length) return buffer;
 
-		const pointer = buffer.readUintLE(0, STORAGE_POSITION_BYTES);
-		const length = buffer.readUintLE(STORAGE_POSITION_BYTES, STORAGE_LENGTH_BYTES);
-
-		return this.loadStorage(pointer, length);
+		return this.loadStorage(
+			buffer.readUintBE(0, STORAGE_POSITION_BYTES),
+			buffer.readUintBE(STORAGE_POSITION_BYTES, STORAGE_LENGTH_BYTES)
+		);
 	}
 
 	loadStorage(position: number, length: number) {
@@ -112,20 +134,44 @@ export class TableStorage {
 		});
 		return buffer;
 	}
+
+	saveStorage(buffer: Buffer) {
+		const position = fstatSync(this.fd.storage).size;
+		console.log("append file", readFileSync(this.fd.storage, { encoding: "utf8" }));
+		appendFileSync(this.fd.storage, buffer);
+		console.log("result", readFileSync(this.fd.storage, { encoding: "utf8" }));
+		return position;
+	}
 }
 
-export interface TableSchema {
-	name: string;
-	columns: ColumnInfo[];
-	last_row?: number;
+export function parseData(buffer: Buffer, type: ColumnType) {
+	switch (type) {
+		case "INT":
+			return buffer.readIntBE(0, 4);
+		case "TEXT":
+			return buffer.toString();
+		case "BOOL":
+			return buffer.readInt8(0) === 1;
+		case "DATE":
+			return new Date(buffer.toString());
+		case "BLOB":
+		default:
+			return buffer;
+	}
 }
 
-export interface ColumnInfo {
-	name: string;
-	type: ColumnType;
-	length?: number; // in bytes, undefined if the column length is dynamic
-	primary_key?: boolean;
-	auto_increment?: boolean;
+export function serializeData(data: any, type: ColumnType) {
+	switch (type) {
+		case "INT":
+			return Buffer.alloc(4).writeIntBE(parseInt(data), 0, 4);
+		case "TEXT":
+			return Buffer.from(data);
+		case "BOOL":
+			return Buffer.alloc(1).writeInt8(data ? 1 : 0, 0);
+		case "DATE":
+			return Buffer.from(data.getTime());
+		case "BLOB":
+		default:
+			return Buffer.from(data);
+	}
 }
-
-export type ColumnType = "TEXT" | "INT" | "BOOL" | "DATE";
