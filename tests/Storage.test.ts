@@ -1,7 +1,6 @@
 import { describe, beforeAll, test } from "@jest/globals";
-import { mkdirSync, rmSync, unlinkSync } from "fs";
+import { mkdirSync } from "fs";
 import { dirname } from "path";
-import { TableStorage } from "../src/Storage";
 import { Table } from "../src/Table";
 
 const db_path = __dirname + "/../tmp/db";

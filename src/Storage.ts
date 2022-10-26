@@ -36,7 +36,7 @@ export class TableStorage {
 	}
 
 	saveSchema(schema: TableSchema) {
-		writeSync(this.fd.schema, JSON.stringify(schema), 0, "utf8");
+		writeSync(this.fd.schema, JSON.stringify(schema, null, 4), 0, "utf8");
 	}
 
 	saveData(index: number, buffer: Buffer) {
